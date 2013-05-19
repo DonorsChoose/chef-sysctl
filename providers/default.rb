@@ -72,12 +72,6 @@ end
 
 # write out a config file
 action :write do
-  @config  = file node[:sysctl_file] do
-    action :nothing
-    owner "root"
-    group "root"
-    mode "0644"
-  end
 
   entries = "#\n# content managed by chef local changes will be overwritten\n#\n"
   r = Hash.new 
@@ -97,13 +91,50 @@ action :write do
   # flatten entries
   entries << r.sort.map { |k,v| "#{k}=#{v}" }.join
 
-  # put those in the config file
-  @config.content entries
+  # So that we can refer to these within the sub-run-context block.
+  cached_new_resource = new_resource
 
-  # tell the config to build itself latter
-  @new_resource.notifies  :create, @new_resource.resources(:file => node[:sysctl_file]) 
-  
+  # Setup a sub-run-context to avoid spurious warnings about
+  # "Cloning resource attributes for file[/etc/sysctl.conf] from prior resource (CHEF-3694)"
+  # which just means the file resource name is duplicated in the run_context.
+  sub_run_context = @run_context.dup
+  sub_run_context.resource_collection = Chef::ResourceCollection.new
+
+  # Declare sub-resources within the sub-run-context. Since they are declared here,
+  # they do not pollute the parent run-context.
+  begin
+    original_run_context, @run_context = @run_context, sub_run_context
+
+    @config  = file node[:sysctl_file] do
+      action :nothing
+      owner "root"
+      group "root"
+      mode "0644"
+      notifies :send_notification, new_resource, :immediately
+    end
+
+    # put the flattened entries in the config file
+    @config.content entries
+
+    # tell the config to build itself later
+    @new_resource.notifies :create, @run_context.resource_collection.find(:file => node[:sysctl_file])
+
+  ensure
+    @run_context = original_run_context
+  end
+
   save_to_node
 end
 
-
+action :send_notification do
+  # Executed from the @config subresource after the :create action updates.
+  # The timestamp in the file system seems to show that a single write happens,
+  # no matter how many sysctl resources exist and/or have changing values.
+  # However, if any sysctl resource does change, every one of them will
+  # fire this updated_by_last_action notification regardless of change.
+  # Presumably this is an artifact of the chef run anatomy, since each
+  # resources uses the entice run_context.resource_collection to assemble
+  # its @config.content entries, but the file comparision and/or writing
+  # due to the :create message happens later/repeatedly. 
+  @new_resource.updated_by_last_action(true)
+end
